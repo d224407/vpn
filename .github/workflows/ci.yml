@@ -9,16 +9,16 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs of the same branch/PR (replaces styfle/cancel-workflow-action, which needs actions: write)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   win:
     runs-on: windows-latest
 
     steps:
-      - name: 🛑 Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
-        with:
-          access_token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Prepare git
         run: git config --global core.autocrlf false
 
@@ -59,11 +59,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🛑 Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
-        with:
-          access_token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: ⬇️ Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -117,11 +112,6 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: 🛑 Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
-        with:
-          access_token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: ⬇️ Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
