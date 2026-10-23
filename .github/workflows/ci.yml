@@ -45,6 +45,35 @@ jobs:
           cd ui\References\Windows
           build.bat
 
+      - name: 🛠 Build portable daemon (IVPN Service.exe)
+        shell: pwsh
+        working-directory: daemon
+        run: |
+          $ver = (Get-Content ../ui/package.json -Raw | ConvertFrom-Json).version
+          $date = Get-Date -Format "yyyy-MM-dd"
+          $ldflags = "-s -w -X github.com/ivpn/desktop-app/daemon/version._version=$ver -X github.com/ivpn/desktop-app/daemon/version._commit=${{ github.sha }} -X github.com/ivpn/desktop-app/daemon/version._time=$date"
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "1"
+          go build -tags release -o "IVPN Service.exe" -trimpath -ldflags $ldflags
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "cgo build failed - retrying without Wi-Fi support (nowifi)"
+            $env:CGO_ENABLED = "0"
+            go build -tags "release nowifi" -o "IVPN Service.exe" -trimpath -ldflags $ldflags
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: 📁 Assemble portable bundle (UI + daemon)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "ui/dist/win-unpacked/IVPN.exe")) { Write-Warning "UI executable not found in ui/dist/win-unpacked" }
+          $dst = "ui/dist/win-unpacked/daemon"
+          New-Item -ItemType Directory -Force "$dst/etc" | Out-Null
+          Copy-Item "daemon/IVPN Service.exe" $dst
+          Copy-Item "daemon/References/common/etc/*" "$dst/etc"
+          # marker file: tells the daemon/UI to work in portable mode (no installer/registry)
+          New-Item -ItemType File -Force "$dst/portable" | Out-Null
+
       - name: 📦 Upload artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

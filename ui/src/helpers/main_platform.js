@@ -3,8 +3,22 @@ import { app } from "electron";
 import path from "path";
 
 const os = require("os");
+const fs = require("fs");
+
+// PORTABLE MODE (Windows): daemon is located in the "daemon" folder next to the UI executable
+// and is marked by the "portable" file. Returns the folder, or null if not in portable mode.
+export function GetPortableDaemonDir() {
+  if (Platform() !== PlatformEnum.Windows) return null;
+  const dir = path.join(path.dirname(process.execPath), "daemon");
+  if (fs.existsSync(path.join(dir, "portable")) && fs.existsSync(path.join(dir, "IVPN Service.exe")))
+    return dir;
+  return null;
+}
 
 async function winInstallFolder() {
+  const portableDir = GetPortableDaemonDir();
+  if (portableDir) return portableDir;
+
   return await new Promise((resolve, reject) => {
     let Registry = require("winreg");
     let regKey = new Registry({

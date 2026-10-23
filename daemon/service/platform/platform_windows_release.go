@@ -27,7 +27,9 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
@@ -53,7 +55,29 @@ func doOsInitForBuild() {
 	kemHelperBinaryPath = path.Join(installDir, "kem", "kem-helper.exe")
 }
 
+// PORTABLE MODE: if a file named "portable" is located next to the daemon executable,
+// the daemon uses its own folder as "install dir" (etc, log, mutable ...)
+// instead of reading the folder from the registry. No installer required.
+func getPortableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	if _, err := os.Stat(filepath.Join(dir, "portable")); err != nil {
+		return ""
+	}
+	for _, sub := range []string{"etc", "log", "mutable"} {
+		_ = os.MkdirAll(filepath.Join(dir, sub), 0o755)
+	}
+	return filepath.ToSlash(dir)
+}
+
 func getInstallDir() string {
+	if portableDir := getPortableDir(); portableDir != "" {
+		return portableDir
+	}
+
 	ret := ""
 
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\IVPN Client`, registry.QUERY_VALUE|registry.WOW64_64KEY)

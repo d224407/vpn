@@ -49,6 +49,10 @@ import { AutoLaunchSet, AutoLaunchIsEnabled } from "@/auto-launch";
 import { DaemonConnectionType, ColorTheme, SplitTunnelMacExtStateEnum } from "@/store/types";
 import daemonClient from "./daemon-client";
 import darwinDaemonInstaller from "./daemon-client/darwin-installer";
+import {
+  IsPortableDaemonAvailable,
+  TryStartPortableDaemon,
+} from "./daemon-client/portable-daemon";
 import { InitTray } from "./tray";
 import { InitPersistentSettings, SaveSettings } from "./settings-persistent";
 import { IsWindowHasFrame, IsWindowHasShadow, IsResizableWindow } from "@/platform/platform";
@@ -79,6 +83,7 @@ let _daemonConnectionCallbackGeneration = 0; // used to ignore disconnect notifi
 let _isConnectingInProgress = false; // used to prevent multiple parallel connection attempts to daemon
 let _firstDaemonConnectionTime = null; // tracks the time of the first attempt to connect to the daemon
 let _macosStartAttempted = false; // tracks whether TryStartDaemon() was already called once
+let _portableStartAttempted = false; // Windows portable mode: tracks whether the bundled daemon start was already attempted
 
 let isTrayInitialized = false;
 let lastRouteArgs = null; // last route arguments (requested by renderer process when window initialized)
@@ -1188,6 +1193,19 @@ async function connectToDaemon() {
     // Connection is live. When the socket closes unexpectedly,
     // onDisconnected() will fire and scheduleReconnect() will be called.
   } catch (e) {
+    // WINDOWS PORTABLE ONLY: start the daemon from the "daemon" folder next to the app – only once
+    if (
+      Platform() === PlatformEnum.Windows &&
+      !_portableStartAttempted &&
+      IsPortableDaemonAvailable()
+    ) {
+      _portableStartAttempted = true;
+      TryStartPortableDaemon();
+      cancelReconnectTimer();
+      scheduleReconnect();
+      return;
+    }
+
     // MACOS ONLY: try to start daemon (privileged helper) – only once
     if (Platform() === PlatformEnum.macOS && !_macosStartAttempted) {
       _macosStartAttempted = true;
