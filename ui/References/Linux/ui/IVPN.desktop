@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=IVPN
+Comment=UI interface for IVPN 
+GenericName=VPN client
+Exec=/opt/ivpn/ui/bin/ivpn-ui
+Icon=/opt/ivpn/ui/ivpnicon.svg
+StartupWMClass=IVPN
+Type=Application
+StartupNotify=true
+Categories=Network;

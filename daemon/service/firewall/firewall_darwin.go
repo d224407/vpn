@@ -1,0 +1,415 @@
+//
+//  Daemon for IVPN Client Desktop
+//  https://github.com/ivpn/desktop-app
+//
+//  Created by Stelnykovych Alexandr.
+//  Copyright (c) 2023 IVPN Limited.
+//
+//  This file is part of the Daemon for IVPN Client Desktop.
+//
+//  The Daemon for IVPN Client Desktop is free software: you can redistribute it and/or
+//  modify it under the terms of the GNU General Public License as published by the Free
+//  Software Foundation, either version 3 of the License, or (at your option) any later version.
+//
+//  The Daemon for IVPN Client Desktop is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+//  or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+//  details.
+//
+//  You should have received a copy of the GNU General Public License
+//  along with the Daemon for IVPN Client Desktop. If not, see <https://www.gnu.org/licenses/>.
+//
+
+package firewall
+
+import (
+	"fmt"
+	"net"
+	"strings"
+
+	"github.com/ivpn/desktop-app/daemon/netinfo"
+	"github.com/ivpn/desktop-app/daemon/service/platform"
+	"github.com/ivpn/desktop-app/daemon/shell"
+)
+
+// Useful commands for testing:
+// sudo pfctl -a ivpn_firewall -s rules
+// sudo pfctl -a ivpn_firewall/tunnel -s rules
+// sudo pfctl -a ivpn_firewall -s Tables
+// sudo pfctl -a ivpn_firewall -t ivpn_servers -T show
+
+var (
+	// key: is a string representation of allowed IP
+	// value: true - if exception rule is persistant (persistant, means will stay available even client is disconnected)
+	allowedHosts map[string]bool
+
+	// GID the Split Tunnel extension runs under (0 - Split Tunnel is not active).
+	// Set by ApplySplitTunnelRouting(); kept here so it survives VPN reconnects.
+	splitTunnelGroupId int
+)
+
+func init() {
+	allowedHosts = make(map[string]bool)
+}
+
+func implInitialize() error { return nil }
+
+func implGetEnabled() (bool, error) {
+	err := shell.Exec(nil, platform.FirewallScript(), "-status")
+
+	if err != nil {
+		exitCode, err := shell.GetCmdExitCode(err)
+		if err != nil {
+			return false, fmt.Errorf("failed to get Cmd exit code: %w", err)
+		}
+		if exitCode == 1 {
+			return false, nil
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func implSetEnabled(isEnabled bool) error {
+	if isEnabled {
+		err := shell.Exec(nil, platform.FirewallScript(), "-enable")
+		if err != nil {
+			return fmt.Errorf("failed to execute shell command: %w", err)
+		}
+		// To fulfill such flow (example): Connected -> FWDisable -> FWEnable
+		// Here we should restore all exceptions (all hosts which are allowed)
+		return reApplyExceptions()
+	}
+	return shell.Exec(nil, platform.FirewallScript(), "-disable")
+}
+
+func implSetPersistant(persistant bool) error {
+	if persistant {
+		// The persistence is based on such facts:
+		// 	- daemon is starting as 'LaunchDaemons'
+		// 	- SetPersistant() called by service object on daemon start
+		// This means we just have to ensure that firewall enabled.
+
+		// Just ensure that firewall is enabled
+		return implSetEnabled(true)
+	}
+	return nil
+}
+
+// ClientConnected - allow communication for local vpn/client IP address
+func implClientConnected(clientLocalIPAddress net.IP, clientLocalIPv6Address net.IP, clientPort int, serverIP net.IP, serverPort int, isTCP bool) error {
+	if err := applyConnectedRules(); err != nil {
+		return err
+	}
+
+	// Connection already established. The rule for VPN interface is defined.
+	// Removing host IP from exceptions
+	isPersistent := false
+	return removeHostsFromExceptions([]string{serverIP.String()}, isPersistent)
+}
+
+// applyConnectedRules (re-)invokes firewall.sh's '-connected' for the
+// currently connected client (tracked by the connected* package vars, set by
+// ClientConnected()/ClientDisconnected()) and the current Split Tunnel state.
+// No-op if not currently connected.
+func applyConnectedRules() error {
+	if connectedClientInterfaceIP == nil {
+		return nil
+	}
+	inf, err := netinfo.InterfaceByIPAddr(connectedClientInterfaceIP)
+	if err != nil {
+		if isClientPaused {
+			// WireGuard pause stops the tunnel process, so its interface is gone;
+			// ClientConnected() reapplies the rules once the connection is back.
+			return nil
+		}
+		return fmt.Errorf("failed to get local interface by IP: %w", err)
+	}
+
+	protocol := "udp"
+	if connectedIsTCP {
+		protocol = "tcp"
+	}
+	scriptArgs := fmt.Sprintf("-connected %s %s %d %s %d %s %d",
+		inf.Name,
+		connectedClientInterfaceIP,
+		connectedClientPort,
+		connectedHostIP,
+		connectedHostPort,
+		protocol,
+		splitTunnelGroupId)
+	if err := shell.Exec(nil, platform.FirewallScript(), scriptArgs); err != nil {
+		return fmt.Errorf("failed to add rule for current connection directions: %w", err)
+	}
+	return nil
+}
+
+// ApplySplitTunnelRouting updates the firewall rules for the current VPN connection
+// (if any) according to the Split Tunnel state, so the change takes effect immediately
+// without requiring a VPN reconnect.
+//
+// stExtensionGroupId is the GID the Split Tunnel extension runs under, or 0 when Split
+// Tunnel is not active. When it is not 0, the intentional-routing NAT/route-to rules are
+// skipped (they would reroute the extension's relayed traffic back into the tunnel) and
+// the extension's traffic is allowed to leave over the physical interface instead.
+//
+// Called only from splittun_darwin.go's implApplyConfig() - darwin-only by construction
+// (both files are platform-suffixed), so no stub is needed on other platforms.
+func ApplySplitTunnelRouting(stExtensionGroupId int) error {
+	mutex.Lock()
+	defer mutex.Unlock()
+	splitTunnelGroupId = stExtensionGroupId
+	return applyConnectedRules()
+}
+
+// ClientDisconnected - Disable communication for local vpn/client IP address
+func implClientDisconnected() error {
+	// remove all exceptions related to current connection (all non-persistant exceptions)
+	err := removeAllHostsFromExceptions()
+	if err != nil {
+		log.Error(err)
+	}
+
+	return shell.Exec(nil, platform.FirewallScript(), "-disconnected")
+}
+
+func implAllowLAN(isAllowLAN bool, isAllowLanMulticast bool) error {
+	// the rule should stay unchanged independently from VPN connection state
+	isPersistent := true
+	localRanges := ipNetListToStrings(netinfo.GetNonRoutableLocalAddrRanges())
+	multicastRanges := ipNetListToStrings(netinfo.GetMulticastAddresses())
+
+	if !isAllowLAN {
+		// LAN NOT ALLOWED: disallow everything (LAN + multicast)
+		return removeHostsFromExceptions(append(localRanges, multicastRanges...), isPersistent)
+	}
+
+	// LAN ALLOWED
+	rangesToAllow := localRanges
+	if isAllowLanMulticast {
+		rangesToAllow = append(rangesToAllow, multicastRanges...)
+	} else {
+		removeHostsFromExceptions(multicastRanges, isPersistent) // disallow Multicast
+	}
+	return addHostsToExceptions(rangesToAllow, isPersistent)
+}
+
+// implAddHostsToExceptions - allow comminication with this hosts
+// Note: if isPersistent == false -> all added hosts will be removed from exceptions after client disconnection (after call 'ClientDisconnected()')
+// Arguments:
+//   - IPs			-	list of IP addresses to ba allowed
+//   - onlyForICMP	-	(not in use for macOS) try add rule to allow only ICMP protocol for this IP
+//   - isPersistent	-	keep rule enabled even if VPN disconnected
+func implAddHostsToExceptions(IPs []net.IP, onlyForICMP bool, isPersistent bool) error {
+	IPsStr := make([]string, 0, len(IPs))
+	for _, ip := range IPs {
+		IPsStr = append(IPsStr, ip.String())
+	}
+
+	return addHostsToExceptions(IPsStr, isPersistent)
+}
+
+func implRemoveHostsFromExceptions(IPs []net.IP, onlyForICMP bool, isPersistent bool) error {
+	IPsStr := make([]string, 0, len(IPs))
+	for _, ip := range IPs {
+		IPsStr = append(IPsStr, ip.String())
+	}
+
+	return removeHostsFromExceptions(IPsStr, isPersistent)
+}
+
+// OnChangeDNS - must be called on each DNS change (to update firewall rules according to new DNS configuration)
+// 'addr' - new DNS address
+// 'isInternal' - TRUE if DNS is internal (in VPN network)
+func implOnChangeDNS(addr []net.IP, isInternal bool) error {
+
+	// Comma-separated list of IPs (must be routed through VPN interface)
+	var dns_ip_pub []string
+	// Comma-separated list of custom local non-routable IP (not in VPN network)
+	// These IP's must be skipped from NAT-ing and routing through VPN interface
+	var dns_ip_lan []string
+
+	for _, svr := range addr {
+		if !isInternal && netinfo.IsLocalNonRoutableIP(svr) {
+			dns_ip_lan = append(dns_ip_lan, svr.String())
+		} else {
+			dns_ip_pub = append(dns_ip_pub, svr.String())
+		}
+	}
+
+	var arg1_public = strings.TrimSpace(strings.Join(dns_ip_pub, ","))
+	var arg2_local = strings.TrimSpace(strings.Join(dns_ip_lan, ","))
+	if len(arg1_public) > 0 {
+		arg1_public = "--ip " + arg1_public
+	}
+	if len(arg2_local) > 0 {
+		arg2_local = "--ip_local " + arg2_local
+	}
+
+	return shell.Exec(log, platform.FirewallScript(), []string{"-set_dns", arg1_public, arg2_local}...)
+}
+
+// implOnUserExceptionsUpdated() called when 'userExceptions' value were updated. Necessary to update firewall rules.
+func implOnUserExceptionsUpdated() error {
+	var expMasks []string
+	for _, mask := range userExceptions {
+		expMasks = append(expMasks, mask.String())
+	}
+
+	return applySetUserExceptions(expMasks)
+}
+
+//---------------------------------------------------------------------
+
+func applySetUserExceptions(hostsIPs []string) error { //
+	ipList := strings.Join(hostsIPs, " ")
+
+	if len(ipList) > 250 {
+		log.Info("-set_user_exceptions <...multiple addresses...>")
+	} else {
+		log.Info("-set_user_exceptions ", ipList)
+	}
+
+	return shell.Exec(nil, platform.FirewallScript(), "-set_user_exceptions", ipList)
+}
+
+func applyAddHostsToExceptions(hostsIPs []string) error { //
+	ipList := strings.Join(hostsIPs, " ")
+
+	if len(ipList) > 0 {
+		if len(ipList) > 250 {
+			log.Info("-add_exceptions <...multiple addresses...>")
+		} else {
+			log.Info("-add_exceptions ", ipList)
+		}
+		return shell.Exec(nil, platform.FirewallScript(), "-add_exceptions", ipList)
+	}
+	return nil
+}
+
+func applyRemoveHostsFromExceptions(hostsIPs []string) error {
+	ipList := strings.Join(hostsIPs, " ")
+
+	if len(ipList) > 0 {
+		if len(ipList) > 250 {
+			log.Info("-remove_exceptions <...multiple addresses...>")
+		} else {
+			log.Info("-remove_exceptions ", ipList)
+		}
+		return shell.Exec(nil, platform.FirewallScript(), "-remove_exceptions", ipList)
+	}
+	return nil
+}
+
+func reApplyExceptions() error {
+
+	// Allow LAN communication (if necessary)
+	// Restore all exceptions (all hosts which are allowed)
+	allowedIPs := make([]string, 0, len(allowedHosts)+2)
+	if len(allowedHosts) > 0 {
+		for ipStr := range allowedHosts {
+			allowedIPs = append(allowedIPs, ipStr)
+		}
+	}
+
+	// Apply all allowed hosts
+	err := applyAddHostsToExceptions(allowedIPs)
+	if err != nil {
+		log.Error(err)
+	}
+
+	err1 := implOnChangeDNS(getDnsIpAddresses())
+	if err1 != nil {
+		log.Error(err1)
+		if err == nil {
+			err = err1
+		}
+	}
+
+	err2 := implOnUserExceptionsUpdated()
+	if err2 != nil {
+		log.Error(err2)
+		if err == nil {
+			err = err2
+		}
+	}
+	return err
+}
+
+//---------------------------------------------------------------------
+
+// allow communication with specified hosts
+// if isPersistant == false - exception will be removed when client disctonnects
+func addHostsToExceptions(IPs []string, isPersistant bool) error {
+	if len(IPs) == 0 {
+		return nil
+	}
+
+	newIPs := make([]string, 0, len(IPs))
+	for _, ip := range IPs {
+		// do not add new IP if it already in exceptions
+		if _, exists := allowedHosts[ip]; !exists {
+			allowedHosts[ip] = isPersistant // add to map
+			newIPs = append(newIPs, ip)
+		}
+	}
+
+	if len(newIPs) == 0 {
+		return nil
+	}
+
+	err := applyAddHostsToExceptions(newIPs)
+	if err != nil {
+		log.Error(err)
+	}
+	return err
+}
+
+// Deprecate comminication with this hosts
+func removeHostsFromExceptions(IPs []string, isPersistant bool) error {
+	if len(IPs) == 0 {
+		return nil
+	}
+
+	toRemoveIPs := make([]string, 0, len(IPs))
+	for _, ip := range IPs {
+		if persVal, exists := allowedHosts[ip]; exists {
+			if persVal != isPersistant {
+				continue
+			}
+			delete(allowedHosts, ip) // remove from map
+			toRemoveIPs = append(toRemoveIPs, ip)
+		}
+	}
+
+	if len(toRemoveIPs) == 0 {
+		return nil
+	}
+
+	err := applyRemoveHostsFromExceptions(toRemoveIPs)
+	if err != nil {
+		log.Error(err)
+	}
+	return err
+}
+
+// removeAllHostsFromExceptions - Remove hosts (which are related to a current connection) from exceptions
+// Note: some exceptions should stay without changes, they are marked as 'persistant'
+//
+//	(has 'true' value in allowedHosts; eg.: LAN and Multicast connectivity)
+func removeAllHostsFromExceptions() error {
+	toRemoveIPs := make([]string, 0, len(allowedHosts))
+	for ipStr := range allowedHosts {
+		toRemoveIPs = append(toRemoveIPs, ipStr)
+	}
+	isPersistant := false
+	return removeHostsFromExceptions(toRemoveIPs, isPersistant)
+}
+
+func implSingleDnsRuleOff() (retErr error) {
+	return nil // nothing to do for this platform
+}
+
+func implSingleDnsRuleOn(dnsAddr []net.IP) (retErr error) {
+	return nil // nothing to do for this platform
+}

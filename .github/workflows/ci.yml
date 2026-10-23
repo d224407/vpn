@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ master, beta, development, test ]
+  push:
+    branches: [ master, beta, development, test ]
+
+permissions:
+  contents: read
+
+jobs:
+  win:
+    runs-on: windows-latest
+
+    steps:
+      - name: 🛑 Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
+        with:
+          access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare git
+        run: git config --global core.autocrlf false
+
+      - name: ⬇️ Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+
+      - name: setup-msbuild
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build
+        shell: cmd
+        run: |
+          cd ui\References\Windows
+          build.bat
+
+      - name: 📦 Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ivpn-windows-${{ github.sha }}
+          path: |
+            ui/References/Windows/bin/*.exe
+            ui/dist/win-unpacked
+          if-no-files-found: warn
+          retention-days: 7
+
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛑 Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
+        with:
+          access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ⬇️ Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+
+      - name: Setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install deps
+        run: sudo apt-get install rpm libiw-dev
+
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: 2.7
+          bundler-cache: false
+
+      - name: Install fpm
+        run: |
+          gem install dotenv -v 2.8.1
+          gem install fpm
+
+      - name: Build CLI
+        run: |
+          cd cli/References/Linux
+          ./build.sh -v $(cat ../../../ui/package.json | grep version | head -1 | awk -F: '{ print $2 }' | sed 's/[",]//g')
+
+      - name: Build UI
+        run: |
+          cd ui/References/Linux
+          ./build.sh -v $(cat ../../package.json | grep version | head -1 | awk -F: '{ print $2 }' | sed 's/[",]//g')
+
+      - name: 📦 Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ivpn-linux-${{ github.sha }}
+          path: |
+            cli/References/Linux/_out_bin/**/*.deb
+            cli/References/Linux/_out_bin/**/*.rpm
+            ui/References/Linux/_out_bin/**/*.deb
+            ui/References/Linux/_out_bin/**/*.rpm
+          if-no-files-found: warn
+          retention-days: 7
+
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: 🛑 Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@d07a454dad7609a92316b57b23c9ccfd4f59af66 # 0.13.1
+        with:
+          access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ⬇️ Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+
+      - name: Setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install deps
+        run: brew install autoconf automake libtool
+
+      - name: Build
+        run: |
+          cd ui/References/macOS
+          ./build.sh -v $(cat ../../package.json | grep version | head -1 | awk -F: '{ print $2 }' | sed 's/[",]//g') -c ${{ env.APPLE_DEVID_CERTIFICATE }}
+        env:
+          APPLE_DEVID_CERTIFICATE: ${{ secrets.APPLE_DEVID_CERTIFICATE || 'DUMMY' }}
+
+      - name: 📦 Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ivpn-macos-${{ github.sha }}
+          path: |
+            ui/References/macOS/_compiled/*.dmg
+            cli/References/macOS/_out_bin/**
+          if-no-files-found: warn
+          retention-days: 7

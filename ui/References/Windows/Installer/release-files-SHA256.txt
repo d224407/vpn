@@ -1,0 +1,1 @@
+OpenVPN\tap\OemVista.inf : FB3A921E83B9FF7C95BC468BD559BF9A00474136B04CC6BEB749D06DF3C07D7A : // checksum verification for this file needed, for example, for situations when git did 'checkout' it with wrong carriage return type
